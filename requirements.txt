@@ -4,3 +4,6 @@ numpy
 opencv-python
 matplotlib
 kornia>=0.6.11
+Pillow
+scipy
+tifffile
