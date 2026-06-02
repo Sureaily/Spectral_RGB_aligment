@@ -28,12 +28,13 @@ python script.py \
     --max_keypoints 7000 \
     --max_void_ratio 0.1 \
     --min_fill_ratio 0.6 \
-    --features aliked disk superpoint sift
+    --features aliked disk superpoint sift \
+    --output_dtype uint16   # 可选 uint8 或 uint16，默认 uint16
 
 说明：
 - 成功配准的图像会裁剪并保存至 output_dir
-- 无法配准（内点不足/分布不均/公共区域为空等）的 RGB 图像会保存至 output_dir/failed_images/ 目录下，
-  文件名格式为 {原图名}_failed.jpg，并在图像上绘制已检测到的内点（红色圆点，带白色外轮廓）。
+- 光谱图像保存为单通道 TIF，位深由 --output_dtype 指定（uint8/uint16）
+- 无法配准的 RGB 图像保存至 output_dir/failed_images/，并绘制内点
 """
 # =================================================
 
@@ -41,46 +42,31 @@ python script.py \
 def parse_args():
     parser = argparse.ArgumentParser(description="RGB与光谱图像配准裁剪工具")
     parser.add_argument('--jsonl_path', type=str,
-                        default='/root/autodl-tmp/pytorch-CycleGAN-and-pix2pix-master/datasets/controlnet-dataset/prompt.json',
-                        help='JSONL文件路径，包含source-target映射')
+                        default='/root/autodl-tmp/pytorch-CycleGAN-and-pix2pix-master/datasets/controlnet-dataset/prompt.json')
     parser.add_argument('--source_root', type=str,
-                        default='/root/autodl-tmp/pytorch-CycleGAN-and-pix2pix-master/datasets/controlnet-dataset/',
-                        help='RGB图像根目录')
+                        default='/root/autodl-tmp/pytorch-CycleGAN-and-pix2pix-master/datasets/controlnet-dataset/')
     parser.add_argument('--target_root', type=str,
-                        default='/root/autodl-tmp/pytorch-CycleGAN-and-pix2pix-master/datasets/controlnet-dataset/',
-                        help='光谱图像根目录')
+                        default='/root/autodl-tmp/pytorch-CycleGAN-and-pix2pix-master/datasets/controlnet-dataset/')
     parser.add_argument('--output_dir', type=str,
-                        default='/root/autodl-tmp/LightGlue-main/Dataset',
-                        help='裁剪结果输出目录')
-    parser.add_argument('--min_inliers', type=int, default=1000,
-                        help='最小内点数量，低于此值跳过该组')
-    parser.add_argument('--grid_size', type=int, default=20,
-                        help='局部单应性网格划分数量')
-    parser.add_argument('--sigma_factor', type=float, default=1.5,
-                        help='高斯权重的sigma因子（相对于图像对角线）')
-    parser.add_argument('--max_keypoints', type=int, default=10000,
-                        help='每个特征提取器最大关键点数量')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
-                        help='运行设备 (cuda/cpu)')
-    # 均匀度判别参数（填充率）
-    parser.add_argument('--max_void_ratio', type=float, default=0.1,
-                        help='最大允许的无内点连通域面积占比（面积/总网格数），超过则考虑拒绝')
-    parser.add_argument('--min_fill_ratio', type=float, default=0.6,
-                        help='最小允许的填充率（面积/外接矩形面积），高于此值且面积占比超限则拒绝（紧凑区域）')
-    parser.add_argument('--skip_existing', action='store_true', default=False,
-                        help='跳过已存在输出文件的组')
-    parser.add_argument('--no_skip_existing', dest='skip_existing', action='store_false',
-                        help='不跳过已存在输出，强制重新处理')
+                        default='/root/autodl-tmp/LightGlue-main/Dataset')
+    parser.add_argument('--min_inliers', type=int, default=1000)
+    parser.add_argument('--grid_size', type=int, default=20)
+    parser.add_argument('--sigma_factor', type=float, default=1.5)
+    parser.add_argument('--max_keypoints', type=int, default=10000)
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--max_void_ratio', type=float, default=0.1)
+    parser.add_argument('--min_fill_ratio', type=float, default=0.6)
+    parser.add_argument('--skip_existing', action='store_true', default=False)
+    parser.add_argument('--no_skip_existing', dest='skip_existing', action='store_false')
     parser.add_argument('--features', type=str, nargs='+',
-                        default=['aliked', 'disk', 'superpoint', 'sift'],
-                        help='使用的特征类型列表')
+                        default=['aliked', 'disk', 'superpoint', 'sift'])
     parser.add_argument('--reverse', action='store_true',
-                        help='是否倒序处理组（用于双服务器并行）')
+                        help='倒序处理组（双服务器并行）')
+    parser.add_argument('--output_dtype', type=str, choices=['uint8', 'uint16'], default='uint16',
+                        help='输出光谱图像的位深，默认 uint16（保持原始精度）')
     return parser.parse_args()
 
 args = parse_args()
-
-# 设置设备
 DEVICE = torch.device(args.device)
 JSONL_PATH = args.jsonl_path
 SOURCE_ROOT = args.source_root
@@ -93,6 +79,7 @@ MAX_KEYPOINTS = args.max_keypoints
 MAX_VOID_RATIO = args.max_void_ratio
 MIN_FILL_RATIO = args.min_fill_ratio
 SKIP_EXISTING = args.skip_existing
+OUTPUT_DTYPE = args.output_dtype   # 'uint8' or 'uint16'
 
 # -------------------- 初始化特征提取器和匹配器 --------------------
 AVAILABLE_FEATURES = {
@@ -104,7 +91,6 @@ AVAILABLE_FEATURES = {
 
 extractors = {}
 matchers = {}
-
 for feat in args.features:
     if feat not in AVAILABLE_FEATURES:
         print(f"警告：特征 {feat} 不可用，跳过")
@@ -112,25 +98,13 @@ for feat in args.features:
     cls, kwargs = AVAILABLE_FEATURES[feat]
     extractors[feat] = cls(**kwargs).eval().to(DEVICE)
     matchers[feat] = LightGlue(features=feat,  depth_confidence=-1, width_confidence=-1).eval().to(DEVICE)
-
 if not extractors:
     raise RuntimeError("未初始化任何特征提取器，请检查 --features 参数")
-
 print(f"已初始化特征器: {list(extractors.keys())}")
-print(f"使用设备: {DEVICE}")
+print(f"使用设备: {DEVICE}，输出光谱数据类型: {OUTPUT_DTYPE}")
 
-# -------------------- 辅助函数：绘制特征点 --------------------
+# -------------------- 辅助函数 --------------------
 def draw_keypoints(img, keypoints, radius=5, color=(0, 0, 255), thickness=-1, outline=True):
-    """
-    在图像上绘制特征点（带白色外轮廓）
-    参数:
-        img: numpy数组 (H,W,3) BGR顺序
-        keypoints: 点列表 [(x,y), ...]
-        radius: 圆点半径
-        color: 内部颜色 (B,G,R)，默认红色
-        thickness: -1表示填充
-        outline: 是否添加白色外轮廓
-    """
     img_copy = img.copy()
     for (x, y) in keypoints:
         pt = (int(x), int(y))
@@ -139,7 +113,7 @@ def draw_keypoints(img, keypoints, radius=5, color=(0, 0, 255), thickness=-1, ou
         cv2.circle(img_copy, pt, radius, color, thickness)
     return img_copy
 
-# -------------------- 图像加载函数 --------------------
+# -------------------- 图像加载 --------------------
 def load_rgb_image(path, resize=None):
     img = Image.open(path).convert('RGB')
     if resize:
@@ -147,34 +121,34 @@ def load_rgb_image(path, resize=None):
     img = np.array(img) / 255.0
     return torch.from_numpy(img).permute(2, 0, 1).float()
 
-def load_tiff_robust(path, resize=None, return_raw=False):
+def load_tiff_robust(path, resize=None):
+    """
+    加载光谱TIFF，返回：
+        tensor_img: 归一化后的单通道张量 (1, H, W)，用于特征匹配
+        raw: 原始数据 numpy 数组 (H, W)，dtype 保持与原文件一致（uint8/uint16）
+    """
     arr = tifffile.imread(path)
     if arr.ndim == 3:
-        arr = np.mean(arr, axis=2)
-    raw = arr.astype(np.uint16)          # 保留原始 uint16
-    # 归一化到 [0,1]（用于显示/匹配）
-    if arr.dtype == np.uint16:
-        arr_norm = arr / 65535.0
-    elif arr.dtype == np.uint8:
-        arr_norm = arr / 255.0
+        arr = np.mean(arr, axis=2).astype(arr.dtype)   # 保留原始类型
+    raw = arr
+    # 归一化到 [0,1]
+    if raw.dtype == np.uint16:
+        arr_norm = raw.astype(np.float32) / 65535.0
+    elif raw.dtype == np.uint8:
+        arr_norm = raw.astype(np.float32) / 255.0
     else:
-        arr_norm = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+        arr_norm = (raw.astype(np.float32) - raw.min()) / (raw.max() - raw.min() + 1e-8)
     if resize:
-        # 对 uint8 可视化图进行缩放，原始 raw 按同样比例缩放（用最近邻或双线性）
         raw = cv2.resize(raw, resize, interpolation=cv2.INTER_NEAREST)
-        arr_norm = cv2.resize((arr_norm * 255).astype(np.uint8), resize) / 255.0
-    else:
-        arr_norm = arr_norm * 255.0
-    # 返回归一化后的 tensor（用于匹配）和原始 raw 数据
-    arr_rgb = np.stack([arr_norm, arr_norm, arr_norm], axis=-1)
-    tensor_img = torch.from_numpy(arr_rgb).permute(2, 0, 1).float()
+        arr_norm = cv2.resize(arr_norm, resize, interpolation=cv2.INTER_LINEAR)
+    # 单通道张量 (1, H, W)
+    tensor_img = torch.from_numpy(arr_norm).unsqueeze(0).float()
     return tensor_img, raw
 
-# -------------------- 计算匹配内点（多特征融合+RANSAC） --------------------
+# -------------------- 匹配内点计算 --------------------
 def compute_inliers(ms_img, rgb_img):
-    """返回内点匹配对 (pts_src, pts_dst) 和内点数量"""
-    all_pts_src = []
-    all_pts_dst = []
+    """返回 pts_src, pts_dst, inliers"""
+    all_pts_src, all_pts_dst = [], []
     for name in extractors:
         extractor = extractors[name]
         matcher = matchers[name]
@@ -196,7 +170,6 @@ def compute_inliers(ms_img, rgb_img):
     merged_pts_src = np.vstack(all_pts_src)
     if len(merged_pts_dst) < 4:
         return None, None, 0
-    # 使用RANSAC得到内点
     H, mask = cv2.findHomography(merged_pts_src, merged_pts_dst, cv2.RANSAC, 3)
     if H is None or mask is None:
         return None, None, 0
@@ -206,10 +179,8 @@ def compute_inliers(ms_img, rgb_img):
     inliers = np.sum(mask)
     return pts_src_inliers, pts_dst_inliers, inliers
 
-# -------------------- 局部单应性变换相关函数 --------------------
+# -------------------- 局部单应性变换（返回映射坐标） --------------------
 def weighted_homography(pts_src, pts_dst, weights):
-    """加权直接线性变换估计单应性矩阵 H (3x3)"""
-    assert len(pts_src) == len(pts_dst) == len(weights)
     n = len(pts_src)
     A = []
     for i in range(n):
@@ -225,62 +196,38 @@ def weighted_homography(pts_src, pts_dst, weights):
 
 def local_homography_warp(img_src, pts_src, pts_dst, img_shape_dst, grid_size=8, sigma=None):
     """
-    使用局部单应性变换将源图像扭曲到目标图像空间。
-    每个网格的邻域半径基于网格对角线自适应计算，内点不足时自动扩大范围。
-    
-    参数:
-        img_src: 源图像 (H_src, W_src, 3) numpy数组，值域[0,255]
-        pts_src: 源图像上的匹配内点 (N,2)
-        pts_dst: 目标图像上的匹配内点 (N,2)
-        img_shape_dst: 目标图像尺寸 (H_dst, W_dst)
-        grid_size: 网格划分数，默认8
-        sigma: 半径比例因子，若为None则使用全局SIGMA_FACTOR。最终半径 = diag * (1 + sigma)
-    返回:
-        warped: 扭曲后的图像 (H_dst, W_dst, 3)
-        mask: 有效像素掩码 (H_dst, W_dst)
+    计算局部单应性映射坐标，同时返回 uint8 可视化图像和掩码。
+    返回: warped_uint8, mask, map_x, map_y
+        warped_uint8: 对齐后的 uint8 三通道（或单通道）图像，用于检查或保存
+        mask: 有效像素掩码
+        map_x, map_y: 映射坐标，可直接用于 cv2.remap 处理任意类型数据
     """
     h_dst, w_dst = img_shape_dst
     h_src, w_src = img_src.shape[:2]
-
-    # 确定sigma因子
     if sigma is None:
         sigma = SIGMA_FACTOR
 
-    # 预计算全局单应矩阵（用于回退）
     H_global = None
     if len(pts_src) >= 4:
         H_global, _ = cv2.findHomography(pts_src, pts_dst, cv2.RANSAC, 3)
 
-    # 生成网格边界
     grid_y = np.linspace(0, h_dst, grid_size + 1).astype(np.int32)
     grid_x = np.linspace(0, w_dst, grid_size + 1).astype(np.int32)
-
-    # 存储每个网格单元的单应性矩阵
     H_cells = []
-    # 构建KDTree加速邻域搜索
     tree = KDTree(pts_dst)
 
-    # 最大尝试次数和半径扩大倍数
     max_attempts = 3
     expansion_factor = 2.0
-
-    # 遍历每个网格单元
     for i in range(grid_size):
         for j in range(grid_size):
             y_start, y_end = grid_y[i], grid_y[i+1]
             x_start, x_end = grid_x[j], grid_x[j+1]
-            # 网格中心点
             cy = (y_start + y_end) // 2
             cx = (x_start + x_end) // 2
             center = np.array([cx, cy], dtype=np.float32)
-
-            # 计算网格的对角线长度
-            cell_w = x_end - x_start
-            cell_h = y_end - y_start
+            cell_w, cell_h = x_end - x_start, y_end - y_start
             diag = np.sqrt(cell_w**2 + cell_h**2)
-            base_radius = diag * (1 + sigma)   # 初始半径
-
-            # 动态扩大半径直到内点数 >= 4 或达到最大尝试次数
+            base_radius = diag * (1 + sigma)
             indices = []
             radius = base_radius
             for attempt in range(max_attempts):
@@ -289,30 +236,23 @@ def local_homography_warp(img_src, pts_src, pts_dst, img_shape_dst, grid_size=8,
                     break
                 radius *= expansion_factor
             else:
-                # 尝试多次后仍不足4个内点，使用全局单应（如果可用）
                 if H_global is not None:
                     H_cells.append(H_global)
                 else:
                     H_cells.append(None)
                 continue
-
-            # 获取邻域内的点
             pts_dst_local = pts_dst[indices]
             pts_src_local = pts_src[indices]
-            # 计算高斯权重，标准差 = radius / 3 （使得距离为radius时权重衰减到约0.011）
             dists = np.linalg.norm(pts_dst_local - center, axis=1)
             sigma_gauss = radius / 3.0
             weights = np.exp(- (dists**2) / (2 * sigma_gauss**2))
-            # 加权估计单应矩阵
             H = weighted_homography(pts_src_local, pts_dst_local, weights)
             H_cells.append(H)
 
-    # 创建映射矩阵和掩码
     map_x = np.zeros((h_dst, w_dst), dtype=np.float32)
     map_y = np.zeros((h_dst, w_dst), dtype=np.float32)
     mask = np.zeros((h_dst, w_dst), dtype=np.uint8)
 
-    # 逐网格应用单应性逆映射
     for i in range(grid_size):
         for j in range(grid_size):
             y_start, y_end = grid_y[i], grid_y[i+1]
@@ -321,32 +261,25 @@ def local_homography_warp(img_src, pts_src, pts_dst, img_shape_dst, grid_size=8,
             H = H_cells[cell_idx]
             if H is None:
                 continue
-
-            # 生成网格内所有像素坐标
             yv, xv = np.meshgrid(np.arange(y_start, y_end), np.arange(x_start, x_end), indexing='ij')
             pts_dst_grid = np.stack([xv.ravel(), yv.ravel()], axis=-1).astype(np.float32)
-            # 逆映射到源图像坐标
             H_inv = np.linalg.inv(H)
             ones = np.ones((len(pts_dst_grid), 1), dtype=np.float32)
             pts_hom = np.hstack([pts_dst_grid, ones])
             pts_src_hom = (H_inv @ pts_hom.T).T
             pts_src_grid = pts_src_hom[:, :2] / pts_src_hom[:, 2:3]
-
-            # 有效性检查
             valid_x = (pts_src_grid[:, 0] >= 0) & (pts_src_grid[:, 0] < w_src - 1)
             valid_y = (pts_src_grid[:, 1] >= 0) & (pts_src_grid[:, 1] < h_src - 1)
             valid = valid_x & valid_y
-
-            # 填充映射表和掩码
             map_x[y_start:y_end, x_start:x_end] = pts_src_grid[:, 0].reshape(y_end-y_start, x_end-x_start)
             map_y[y_start:y_end, x_start:x_end] = pts_src_grid[:, 1].reshape(y_end-y_start, x_end-x_start)
             mask[y_start:y_end, x_start:x_end] = valid.reshape(y_end-y_start, x_end-x_start).astype(np.uint8)
 
-    # 图像扭曲
-    warped = cv2.remap(img_src, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    return warped, mask
+    # 生成可视化图像（兼容单/三通道）
+    warped_uint8 = cv2.remap(img_src, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return warped_uint8, mask, map_x, map_y
 
-# -------------------- 最大内接矩形函数 --------------------
+# -------------------- 最大内接矩形 --------------------
 def largest_inner_rectangle(mask):
     h, w = mask.shape
     height = np.zeros((h, w), dtype=np.int32)
@@ -381,61 +314,38 @@ def largest_inner_rectangle(mask):
                 best_rect = (last_j, i - hh + 1, w - last_j, hh)
     return best_rect
 
-# -------------------- 均匀度判别函数（使用填充率） --------------------
+# -------------------- 均匀度判别 --------------------
 def check_large_compact_void(points, image_shape, grid_size, max_void_ratio, min_fill_ratio):
-    """
-    检测是否存在大面积且紧凑的无内点连通区域。
-    仅考虑面积最大的无内点连通域，如果其面积占比 > max_void_ratio 且
-    填充率（面积/外接矩形面积） > min_fill_ratio，则返回不均匀（False）。
-    返回 (is_uniform, area_ratio, fill_ratio)
-    """
     h, w = image_shape
-    grid_h = h / grid_size
-    grid_w = w / grid_size
-
-    # 标记无内点网格（1表示无点，0表示有点）
+    grid_h, grid_w = h / grid_size, w / grid_size
     grid_map = np.ones((grid_size, grid_size), dtype=np.uint8)
     for (x, y) in points:
         col = min(int(x // grid_w), grid_size - 1)
         row = min(int(y // grid_h), grid_size - 1)
         grid_map[row, col] = 0
-
-    # 八连通标记
     labeled, num_features = ndimage.label(grid_map, structure=np.ones((3,3)))
     if num_features == 0:
         return True, 0, 0
-
-    # 找出面积最大的连通域
-    max_area = 0
-    max_mask = None
+    max_area, max_mask = 0, None
     for label_id in range(1, num_features+1):
         mask = (labeled == label_id)
         area = np.sum(mask)
         if area > max_area:
             max_area = area
             max_mask = mask
-
     if max_mask is None:
         return True, 0, 0
-
     total_cells = grid_size * grid_size
     area_ratio = max_area / total_cells
-
-    # 如果面积占比未超过阈值，直接返回均匀
     if area_ratio <= max_void_ratio:
         return True, area_ratio, 0
-
-    # 计算外接矩形
     rows, cols = np.where(max_mask)
     r_min, r_max = rows.min(), rows.max()
     c_min, c_max = cols.min(), cols.max()
-    width = c_max - c_min + 1
-    height = r_max - r_min + 1
-    bounding_area = width * height
+    bounding_area = (r_max - r_min + 1) * (c_max - c_min + 1)
     if bounding_area == 0:
         return True, area_ratio, 0
-
-    fill_ratio = max_area / bounding_area  # 填充率
+    fill_ratio = max_area / bounding_area
     if fill_ratio > min_fill_ratio:
         return False, area_ratio, fill_ratio
     else:
@@ -447,7 +357,6 @@ def main():
     failed_dir = os.path.join(OUTPUT_DIR, 'failed_images')
     os.makedirs(failed_dir, exist_ok=True)
 
-    # 读取JSONL文件并按source分组
     print("读取映射文件...")
     groups = defaultdict(list)
     with open(JSONL_PATH, 'r', encoding='utf-8') as f:
@@ -456,11 +365,8 @@ def main():
             if not line:
                 continue
             item = json.loads(line)
-            src = item['source']
-            tgt = item['target']
-            groups[src].append(tgt)
+            groups[item['source']].append(item['target'])
 
-    # 转换为列表并可选倒序
     items = list(groups.items())
     if args.reverse:
         items.reverse()
@@ -472,29 +378,25 @@ def main():
     skip_no_match = 0
     skip_others = 0
     skip_existing = 0
-
     BAND_NAMES = ['G', 'R', 'NIR', 'RE']
 
     for idx, (src_rel, tgt_list) in enumerate(items, 1):
         print(f"\n===== 处理第 {idx}/{total} 组: {src_rel} =====")
-
         rgb_path = os.path.join(SOURCE_ROOT, src_rel)
         if not os.path.exists(rgb_path):
             print(f"  RGB图像不存在: {rgb_path}，跳过")
             skip_others += 1
             continue
-
         if len(tgt_list) != 4:
             print(f"  光谱图像数量为 {len(tgt_list)}，预期4，跳过")
             skip_others += 1
             continue
 
-        # 基础文件名（与输出一致）
         base_name = os.path.splitext(os.path.basename(src_rel))[0]
         if base_name.endswith('_D'):
             base_name = base_name[:-2]
 
-        # 检查输出文件是否已存在
+        # 跳过已存在
         if SKIP_EXISTING:
             rgb_out_path = os.path.join(OUTPUT_DIR, f"{base_name}_rgb_cropped.jpg")
             all_exist = os.path.exists(rgb_out_path)
@@ -513,7 +415,6 @@ def main():
                 skip_existing += 1
                 continue
 
-        # 加载RGB图像
         try:
             rgb_img = load_rgb_image(rgb_path).to(DEVICE)
             rgb_np = (rgb_img.cpu().permute(1,2,0).numpy() * 255).astype(np.uint8)
@@ -523,11 +424,12 @@ def main():
             skip_others += 1
             continue
 
-        aligned_images = []
+        aligned_images = []        # 用于最终裁剪的数组（单通道，类型由输出决定）
         masks = []
         all_success = True
         success_pts_dst_list = []
-        last_pts_dst = None          # 保存最近一次计算的内点（即使不满足条件）
+        last_pts_dst = None
+        raw_data_list = []         # 存储原始 raw 数据，需要时使用
 
         for tgt_rel in tgt_list:
             tgt_path = os.path.join(TARGET_ROOT, tgt_rel)
@@ -537,54 +439,64 @@ def main():
                 break
 
             try:
-                ms_img = load_tiff_robust(tgt_path).to(DEVICE)
-                ms_np = (ms_img.cpu().permute(1,2,0).numpy() * 255).astype(np.uint8)
+                ms_img, raw = load_tiff_robust(tgt_path)
+                ms_img = ms_img.to(DEVICE)
+                raw_data_list.append(raw)
+                # 用于显示的 uint8 版本（兼容原可视化）
+                ms_np_uint8 = (ms_img.cpu().squeeze(0).numpy() * 255).astype(np.uint8)
             except Exception as e:
                 print(f"  加载光谱图像失败: {e}，跳过整组")
                 all_success = False
                 break
 
-            # 计算匹配内点
             pts_src, pts_dst, inliers = compute_inliers(ms_img, rgb_img)
-            last_pts_dst = pts_dst   # 记录本次计算结果（可能为 None）
-
+            last_pts_dst = pts_dst
             if pts_src is None or inliers < MIN_INLIERS:
                 print(f"  匹配内点不足 ({inliers} < {MIN_INLIERS})，跳过整组")
                 all_success = False
                 break
 
-            # 均匀度判别
             is_uniform, area_ratio, fill_ratio = check_large_compact_void(
-                pts_dst, (h_rgb, w_rgb), grid_size=GRID_SIZE,
-                max_void_ratio=MAX_VOID_RATIO, min_fill_ratio=MIN_FILL_RATIO
-            )
+                pts_dst, (h_rgb, w_rgb), GRID_SIZE, MAX_VOID_RATIO, MIN_FILL_RATIO)
             if not is_uniform:
-                print(f"  内点分布不均匀：最大无内点区域面积占比 {area_ratio:.3f} > {MAX_VOID_RATIO}，填充率 {fill_ratio:.3f} > {MIN_FILL_RATIO}，跳过整组")
+                print(f"  内点分布不均匀：最大空区面积占比 {area_ratio:.3f} > {MAX_VOID_RATIO}，填充率 {fill_ratio:.3f} > {MIN_FILL_RATIO}，跳过整组")
                 all_success = False
                 break
 
-            # 记录成功的内点
             success_pts_dst_list.append(pts_dst)
 
-            # 局部单应性变换
-            aligned, mask = local_homography_warp(
-                ms_np, pts_src, pts_dst, (h_rgb, w_rgb),
-                grid_size=GRID_SIZE, sigma=None
-            )
+            # 计算映射坐标和掩码
+            _, mask, map_x, map_y = local_homography_warp(
+                ms_np_uint8, pts_src, pts_dst, (h_rgb, w_rgb),
+                grid_size=GRID_SIZE, sigma=None)
+
+            # 根据输出类型生成最终对齐图像
+            if OUTPUT_DTYPE == 'uint16':
+                # 使用最近邻插值保持原始值
+                aligned = cv2.remap(raw, map_x, map_y, cv2.INTER_NEAREST,
+                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            else:
+                # 使用线性插值，并转为 uint8
+                aligned = cv2.remap(raw, map_x, map_y, cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                # 确保范围并转为 uint8
+                if raw.dtype == np.uint16:
+                    aligned = np.clip(aligned, 0, 65535)
+                    aligned = (aligned / 256).astype(np.uint8)  # 16位转8位（高位截断）
+                else:
+                    aligned = aligned.astype(np.uint8)
+
             aligned_images.append(aligned)
             masks.append(mask)
 
-        # 如果因匹配失败而跳过，保存失败图像（优先绘制成功的内点，否则绘制最后一次计算的内点）
+        # 如果失败，保存失败图像
         if not all_success:
-            # 确定要绘制的点集
             if success_pts_dst_list:
                 all_pts_dst = np.vstack(success_pts_dst_list)
             elif last_pts_dst is not None:
                 all_pts_dst = last_pts_dst
             else:
                 all_pts_dst = np.empty((0,2))
-
-            # 绘制内点并保存（注意：rgb_np 是 BGR 顺序，draw_keypoints 中 color 也是 BGR）
             img_with_pts = draw_keypoints(rgb_np, all_pts_dst, radius=8, color=(255, 0, 0), thickness=-1, outline=True)
             failed_path = os.path.join(failed_dir, f"{base_name}_failed.jpg")
             Image.fromarray(img_with_pts).save(failed_path, quality=95)
@@ -594,36 +506,30 @@ def main():
 
         # 计算公共区域
         rgb_mask = np.ones((h_rgb, w_rgb), dtype=np.uint8)
-        all_masks = [rgb_mask] + masks
-        intersection_mask = all_masks[0].copy()
-        for m in all_masks[1:]:
+        intersection_mask = rgb_mask.copy()
+        for m in masks:
             intersection_mask = cv2.bitwise_and(intersection_mask, m)
 
         if np.sum(intersection_mask) == 0:
             print("  公共区域为空，跳过")
-            # 公共区域为空也保存失败图像（绘制所有成功配准的内点）
-            all_pts_dst = np.vstack(success_pts_dst_list) if success_pts_dst_list else np.empty((0,2))
+            all_pts_dst = np.vstack(success_pts_dst_list)
             img_with_pts = draw_keypoints(rgb_np, all_pts_dst, radius=5, color=(0,0,255), thickness=-1, outline=True)
             failed_path = os.path.join(failed_dir, f"{base_name}_failed.jpg")
             Image.fromarray(img_with_pts).save(failed_path, quality=95)
-            print(f"  保存失败图像（含内点）至: {failed_path}")
             skip_others += 1
             continue
 
         x, y, w, h = largest_inner_rectangle(intersection_mask)
         if w == 0 or h == 0:
             print("  最大内接矩形面积为0，跳过")
-            # 矩形面积为0也保存失败图像
-            all_pts_dst = np.vstack(success_pts_dst_list) if success_pts_dst_list else np.empty((0,2))
+            all_pts_dst = np.vstack(success_pts_dst_list)
             img_with_pts = draw_keypoints(rgb_np, all_pts_dst, radius=5, color=(0,0,255), thickness=-1, outline=True)
             failed_path = os.path.join(failed_dir, f"{base_name}_failed.jpg")
             Image.fromarray(img_with_pts).save(failed_path, quality=95)
-            print(f"  保存失败图像（含内点）至: {failed_path}")
             skip_others += 1
             continue
 
-        x_max = x + w - 1
-        y_max = y + h - 1
+        x_max, y_max = x + w - 1, y + h - 1
         print(f"  裁剪矩形: [{x}, {y}] -> [{x_max}, {y_max}], 尺寸 {h}x{w}")
 
         # 保存RGB
@@ -632,7 +538,7 @@ def main():
         Image.fromarray(rgb_cropped).save(rgb_out_path, format='JPEG', quality=95)
         print(f"  保存RGB裁剪: {rgb_out_path}")
 
-        # 保存光谱
+        # 保存光谱（单通道，指定类型）
         for i, aligned in enumerate(aligned_images):
             cropped = aligned[y:y_max+1, x:x_max+1]
             tgt_name = os.path.basename(tgt_list[i])
@@ -641,17 +547,16 @@ def main():
             else:
                 band = BAND_NAMES[i]
             ms_out_path = os.path.join(OUTPUT_DIR, f"{base_name}_MS_{band}_cropped.tif")
-            tifffile.imwrite(ms_out_path, cropped)
-            print(f"  保存光谱裁剪: {ms_out_path}")
+            tifffile.imwrite(ms_out_path, cropped, photometric='minisblack')
+            print(f"  保存光谱裁剪 ({OUTPUT_DTYPE}): {ms_out_path}")
 
         success += 1
 
-    # 统计输出
     print("\n" + "="*50)
     print(f"处理完成！总计 {total} 组")
-    print(f"成功裁剪（本次处理）: {success} 组")
+    print(f"成功裁剪: {success} 组")
     print(f"跳过已存在输出: {skip_existing} 组")
-    print(f"因匹配点不足/分布不均跳过: {skip_no_match} 组")
+    print(f"因匹配/分布问题跳过: {skip_no_match} 组")
     print(f"其他原因跳过: {skip_others} 组")
     print("="*50)
 
