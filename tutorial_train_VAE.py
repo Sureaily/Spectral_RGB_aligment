@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR   # 新增导入
 # ========================= 配置 =========================
 resume_path = '/mnt/data/Sureaily/ControlNet-main/vae_4ch_epoch410.pth'
 batch_size = 1
-learning_rate = 1e-7
+learning_rate = 1e-4
 total_epochs = 500
 save_every = 10
 
@@ -37,7 +37,7 @@ model.cuda()
 optimizer = torch.optim.AdamW(model.first_stage_model.parameters(), lr=learning_rate)
 
 # ========================= 学习率调度器（余弦退火） =========================
-scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-10)
+scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-8)
 
 # ========================= 数据 =========================
 dataset = MyDataset()
