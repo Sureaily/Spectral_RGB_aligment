@@ -64,9 +64,13 @@ BibTeX:
 Dataset layout
 
 Dataset/
+
 ├── source/             # 3-channel RGB jpg (condition / hint)
+
 ├── target/             # 4-band tif, band order G, R, RE, NIR
+
 ├── prompt.json         # training pairs
+
 └── prompt_test.json    # validation pairs
 ```
 
