@@ -1,7 +1,7 @@
 --------------------------------------------------------------------------------
 Multispectral UAV Data of Jujube Orchard dataset (~170 GB, 15,414 files) is
 hosted on Kaggle under CC BY 4.0:
-https://www.kaggle.com/datasets/xuyalei/jujube-uav-multispectral-20251107
+https://www.kaggle.com/datasets/xuyalei/jujube-uav-multispectral
 --------------------------------------------------------------------------------
 
 This dataset contains raw UAV RGB and multispectral imagery of jujube orchards
